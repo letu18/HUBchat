@@ -165,6 +165,7 @@ HTML_TEMPLATE = '''
             padding: 20px;
             overflow-y: auto;
             scroll-behavior: smooth;
+            min-height: 0; /* Ensure messages container can shrink and scroll */
         }
 
         .message {
@@ -376,7 +377,7 @@ HTML_TEMPLATE = '''
             <div class="welcome-screen" id="welcome-screen">
                 <div class="welcome-content">
                     <h2>🎭 Chào mừng đến HUBchat</h2>
-                    <p>Kết nối với những người lạ từ HUB</p>
+                    <p>Kết nối với những người lạ từ khắp nơi trên thế giới</p>
                     <button id="start-chat-btn" class="btn btn-primary">Bắt đầu trò chuyện</button>
                 </div>
             </div>
