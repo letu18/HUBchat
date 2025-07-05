@@ -2,6 +2,7 @@ from flask import Flask, render_template_string, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import uuid
 import random
+import os
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'hubchat_secret_key'
@@ -742,8 +743,5 @@ def next_stranger():
         find_stranger()
 
 if __name__ == '__main__':
-    import os
-    # Lấy PORT từ environment variable (Railway sẽ cung cấp)
     port = int(os.environ.get('PORT', 5000))
-    # Chạy với production settings
-    socketio.run(app, host='0.0.0.0', port=port, debug=False)
+    socketio.run(app, debug=True, host='0.0.0.0', port=port)
