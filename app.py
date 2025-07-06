@@ -1,772 +1,632 @@
 from flask import Flask, render_template_string, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import uuid
-import random
+from datetime import datetime
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'hubchat_secret_key'
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Lưu trữ người dùng và phòng chat
+# Storage
 users = {}
 waiting_users = []
 active_rooms = {}
 
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@socketio.on('connect')
+def handle_connect():
+    user_id = str(uuid.uuid4())[:8]
+    users[request.sid] = {
+        'id': user_id,
+        'room': None,
+        'partner': None
+    }
+    print(f"User {user_id} connected")
+
+@socketio.on('find_stranger')
+def handle_find_stranger():
+    current_user = users.get(request.sid)
+    if not current_user:
+        return
+    
+    if waiting_users:
+        # Match với user đang đợi
+        partner_sid = waiting_users.pop(0)
+        partner = users.get(partner_sid)
+        
+        if partner:
+            room_id = str(uuid.uuid4())[:8]
+            
+            # Update user info
+            current_user['room'] = room_id
+            current_user['partner'] = partner_sid
+            partner['room'] = room_id
+            partner['partner'] = request.sid
+            
+            # Join room
+            join_room(room_id, sid=request.sid)
+            join_room(room_id, sid=partner_sid)
+            
+            # Store room info
+            active_rooms[room_id] = [request.sid, partner_sid]
+            
+            # Notify both users
+            emit('stranger_found', {
+                'room_id': room_id,
+                'your_id': current_user['id'],
+                'is_initiator': True
+            }, room=request.sid)
+            
+            emit('stranger_found', {
+                'room_id': room_id,
+                'your_id': partner['id'],
+                'is_initiator': False
+            }, room=partner_sid)
+            
+            print(f"Matched: {current_user['id']} <-> {partner['id']} in room {room_id}")
+    else:
+        # Thêm vào waiting list
+        waiting_users.append(request.sid)
+        emit('waiting_for_stranger')
+
+@socketio.on('send_message')
+def handle_message(data):
+    current_user = users.get(request.sid)
+    if not current_user or not current_user['room']:
+        return
+    
+    message_data = {
+        'message': data['message'],
+        'sender_id': current_user['id'],
+        'sender_sid': request.sid,  # Thêm sender_sid để phân biệt
+        'timestamp': datetime.now().strftime('%H:%M'),
+        'room_id': current_user['room']
+    }
+    
+    # Gửi tin nhắn đến tất cả trong room
+    emit('receive_message', message_data, room=current_user['room'])
+    print(f"Message from {current_user['id']}: {data['message']}")
+
+@socketio.on('typing')
+def handle_typing():
+    current_user = users.get(request.sid)
+    if current_user and current_user['room'] and current_user['partner']:
+        emit('user_typing', {'user_id': current_user['id']}, room=current_user['partner'])
+
+@socketio.on('stop_typing')
+def handle_stop_typing():
+    current_user = users.get(request.sid)
+    if current_user and current_user['room'] and current_user['partner']:
+        emit('user_stop_typing', room=current_user['partner'])
+
+@socketio.on('next_stranger')
+def handle_next_stranger():
+    current_user = users.get(request.sid)
+    if not current_user:
+        return
+    
+    # Leave current room
+    if current_user['room']:
+        leave_room(current_user['room'])
+        
+        # Notify partner
+        if current_user['partner']:
+            partner = users.get(current_user['partner'])
+            if partner:
+                partner['room'] = None
+                partner['partner'] = None
+                emit('stranger_disconnected', room=current_user['partner'])
+        
+        # Clean up room
+        if current_user['room'] in active_rooms:
+            del active_rooms[current_user['room']]
+    
+    # Reset user
+    current_user['room'] = None
+    current_user['partner'] = None
+    
+    # Find new stranger
+    handle_find_stranger()
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    current_user = users.get(request.sid)
+    if current_user:
+        # Remove from waiting list
+        if request.sid in waiting_users:
+            waiting_users.remove(request.sid)
+        
+        # Notify partner
+        if current_user['partner']:
+            partner = users.get(current_user['partner'])
+            if partner:
+                partner['room'] = None
+                partner['partner'] = None
+                emit('stranger_disconnected', room=current_user['partner'])
+        
+        # Clean up room
+        if current_user['room'] and current_user['room'] in active_rooms:
+            del active_rooms[current_user['room']]
+        
+        # Remove user
+        del users[request.sid]
+        print(f"User {current_user['id']} disconnected")
+
+# HTML Template với JavaScript đã fix
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HUBchat - Anonymous Chat</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <title>HUBchat - Chat ẩn danh</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
     <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
+        
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
         }
-
+        
         body {
             font-family: 'Inter', sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            height: 100vh;
+            min-height: 100vh;
             display: flex;
             justify-content: center;
             align-items: center;
-            overflow: hidden; /* Ngăn body scroll */
+            padding: 20px;
         }
-
-        .chat-container {
-            width: 450px;
-            height: 600px;
-            background: rgba(255, 255, 255, 0.95);
+        
+        .container {
+            background: rgba(255, 255, 255, 0.1);
             backdrop-filter: blur(10px);
             border-radius: 20px;
-            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            width: 100%;
+            max-width: 800px;
+            height: 600px;
             display: flex;
             flex-direction: column;
             overflow: hidden;
-            position: relative; /* Fix position */
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
         }
-
-        .chat-header {
-            background: linear-gradient(135deg, #2c3e50, #34495e);
-            color: white;
+        
+        .header {
+            background: rgba(255, 255, 255, 0.1);
             padding: 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-shrink: 0; /* Không co lại */
+            text-align: center;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
         }
-
-        .header-left h1 {
+        
+        .header h1 {
+            color: white;
             font-size: 24px;
             font-weight: 600;
             margin-bottom: 5px;
         }
-
-        .online-status {
-            display: flex;
-            align-items: center;
+        
+        .header p {
+            color: rgba(255, 255, 255, 0.8);
             font-size: 14px;
-            opacity: 0.8;
         }
-
-        .status-dot {
-            width: 8px;
-            height: 8px;
-            background: #2ecc71;
-            border-radius: 50%;
-            margin-right: 8px;
-            animation: pulse 2s infinite;
-        }
-
-        @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.5; }
-            100% { opacity: 1; }
-        }
-
-        .header-right {
-            display: flex;
-            align-items: center;
-            gap: 15px;
-        }
-
-        .connection-status {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 12px;
-        }
-
-        .status-indicator {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-        }
-
-        .status-indicator.connected {
-            background: #2ecc71;
-        }
-
-        .status-indicator.disconnected {
-            background: #e74c3c;
-        }
-
-        .status-indicator.connecting {
-            background: #f39c12;
-        }
-
-        /* ===== CHAT BODY - FIX CHÍNH ===== */
-        .chat-body {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            position: relative;
-            height: 0; /* Quan trọng: force flex child height */
-            overflow: hidden;
-        }
-
-        .welcome-screen {
-            flex: 1;
-            display: flex;
-            justify-content: center;
-            align-items: center;
+        
+        .status {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 15px 20px;
+            color: rgba(255, 255, 255, 0.9);
+            font-size: 14px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
             text-align: center;
-            padding: 40px;
         }
-
-        .welcome-content {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-        }
-
-        .welcome-content h2 {
-            color: #2c3e50;
-            margin-bottom: 10px;
-            font-weight: 500;
-        }
-
-        .welcome-content p {
-            color: #7f8c8d;
-            margin-bottom: 30px;
-        }
-
-        /* ===== MESSAGES CONTAINER - FIX SCROLLBAR ===== */
-        .messages-container {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            height: 100%;
-            overflow: hidden;
-        }
-
-        .messages {
+        
+        .chat-area {
             flex: 1;
             padding: 20px;
             overflow-y: auto;
-            overflow-x: hidden;
-            scroll-behavior: smooth;
-            height: 0; /* Quan trọng */
-            
-            /* Custom Scrollbar */
-            scrollbar-width: thin;
-            scrollbar-color: #667eea #f0f0f0;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
         }
-
-        /* Custom Scrollbar cho Webkit browsers */
-        .messages::-webkit-scrollbar {
-            width: 8px;
+        
+        .message {
+            max-width: 70%;
+            padding: 12px 16px;
+            border-radius: 18px;
+            word-wrap: break-word;
+            animation: fadeIn 0.3s ease;
+            position: relative;
         }
-
-        .messages::-webkit-scrollbar-track {
-            background: rgba(240, 240, 240, 0.5);
-            border-radius: 10px;
-            margin: 5px;
+        
+        /* TIN NHẮN CỦA TÔI - BÊN PHẢI */
+        .message.my-message {
+            align-self: flex-end;
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            color: white;
+            border-bottom-right-radius: 5px;
         }
-
-        .messages::-webkit-scrollbar-thumb {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            border-radius: 10px;
+        
+        /* TIN NHẮN CỦA ĐỐI PHƯƠNG - BÊN TRÁI */
+        .message.their-message {
+            align-self: flex-start;
+            background: rgba(255, 255, 255, 0.9);
+            color: #333;
+            border-bottom-left-radius: 5px;
+        }
+        
+        .message-time {
+            font-size: 11px;
+            opacity: 0.7;
+            margin-top: 4px;
+            display: block;
+        }
+        
+        .typing-indicator {
+            align-self: flex-start;
+            background: rgba(255, 255, 255, 0.9);
+            color: #666;
+            padding: 12px 16px;
+            border-radius: 18px;
+            border-bottom-left-radius: 5px;
+            font-style: italic;
+            animation: pulse 1.5s infinite;
+        }
+        
+        .input-area {
+            padding: 20px;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        
+        .message-input {
+            flex: 1;
+            padding: 12px 16px;
+            border: none;
+            border-radius: 25px;
+            background: rgba(255, 255, 255, 0.9);
+            color: #333;
+            font-size: 14px;
+            outline: none;
             transition: all 0.3s ease;
         }
-
-        .messages::-webkit-scrollbar-thumb:hover {
-            background: linear-gradient(135deg, #5a6fd8 0%, #6a4190 100%);
-            transform: scaleY(1.1);
+        
+        .message-input:focus {
+            background: white;
+            box-shadow: 0 0 0 2px rgba(79, 172, 254, 0.3);
         }
-
-        .messages::-webkit-scrollbar-corner {
-            background: transparent;
+        
+        .send-button, .next-button {
+            padding: 12px 20px;
+            border: none;
+            border-radius: 25px;
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            color: white;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            font-size: 14px;
         }
-
-        .message {
-            margin-bottom: 15px;
-            animation: fadeIn 0.3s ease-in;
-            word-wrap: break-word;
-            max-width: 100%;
+        
+        .send-button:hover, .next-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(79, 172, 254, 0.4);
         }
-
+        
+        .send-button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .start-button {
+            padding: 15px 30px;
+            border: none;
+            border-radius: 25px;
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            color: white;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 16px;
+            margin: 20px auto;
+            display: block;
+            transition: all 0.3s ease;
+        }
+        
+        .start-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(79, 172, 254, 0.4);
+        }
+        
+        .controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(10px); }
             to { opacity: 1; transform: translateY(0); }
         }
-
-        .message.system {
-            text-align: center;
-            color: #7f8c8d;
-            font-style: italic;
-            font-size: 14px;
-            padding: 10px;
-            background: rgba(127, 140, 141, 0.1);
-            border-radius: 15px;
-            margin: 10px 0;
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
         }
-
-        .message.user {
-            display: flex;
-            justify-content: flex-end;
-        }
-
-        .message.stranger {
-            display: flex;
-            justify-content: flex-start;
-        }
-
-        .message-bubble {
-            max-width: 75%;
-            padding: 12px 16px;
-            border-radius: 18px;
-            word-wrap: break-word;
-            word-break: break-word;
-            position: relative;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-        }
-
-        .message.user .message-bubble {
-            background: linear-gradient(135deg, #667eea, #764ba2);
-            color: white;
-            border-bottom-right-radius: 4px;
-        }
-
-        .message.stranger .message-bubble {
-            background: #f1f3f4;
-            color: #2c3e50;
-            border-bottom-left-radius: 4px;
-        }
-
-        .message-time {
-            font-size: 11px;
-            opacity: 0.7;
-            margin-top: 5px;
-            text-align: right;
-        }
-
-        .message.stranger .message-time {
-            text-align: left;
-        }
-
-        /* ===== TYPING INDICATOR - FIX ===== */
-        .typing-indicator {
-            padding: 10px 20px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            color: #7f8c8d;
-            font-size: 14px;
-            flex-shrink: 0; /* Không co lại */
-            background: rgba(127, 140, 141, 0.05);
-            border-top: 1px solid rgba(127, 140, 141, 0.1);
-        }
-
-        .typing-dots {
-            display: flex;
-            gap: 4px;
-        }
-
-        .typing-dots span {
+        
+        .chat-area::-webkit-scrollbar {
             width: 6px;
-            height: 6px;
-            background: #bdc3c7;
-            border-radius: 50%;
-            animation: typing 1.4s infinite ease-in-out;
         }
-
-        .typing-dots span:nth-child(1) { animation-delay: -0.32s; }
-        .typing-dots span:nth-child(2) { animation-delay: -0.16s; }
-
-        @keyframes typing {
-            0%, 80%, 100% { transform: scale(0.8); opacity: 0.5; }
-            40% { transform: scale(1); opacity: 1; }
+        
+        .chat-area::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
         }
-
-        /* ===== CHAT FOOTER - FIX POSITION ===== */
-        .chat-footer {
-            padding: 20px;
-            background: #f8f9fa;
-            border-top: 1px solid #e9ecef;
-            flex-shrink: 0; /* Không co lại */
-            position: relative;
-            z-index: 10;
-        }
-
-        .message-input-container {
-            display: flex;
-            gap: 10px;
-            align-items: center;
-        }
-
-        #message-input {
-            flex: 1;
-            padding: 12px 16px;
-            border: 2px solid #e9ecef;
-            border-radius: 25px;
-            font-size: 14px;
-            outline: none;
-            transition: border-color 0.3s ease;
-            background: white;
-        }
-
-        #message-input:focus {
-            border-color: #667eea;
-            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
-        }
-
-        #message-input:disabled {
-            background: #f8f9fa;
-            cursor: not-allowed;
-            opacity: 0.7;
-        }
-
-        .btn {
-            padding: 10px 20px;
-            border: none;
-            border-radius: 20px;
-            font-size: 14px;
-            font-weight: 500;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        .btn:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-
-        .btn-primary {
-            background: linear-gradient(135deg, #667eea, #764ba2);
-            color: white;
-        }
-
-        .btn-primary:hover:not(:disabled) {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
-        }
-
-        .btn-secondary {
-            background: rgba(255, 255, 255, 0.2);
-            color: white;
-            border: 1px solid rgba(255, 255, 255, 0.3);
-        }
-
-        .btn-secondary:hover:not(:disabled) {
+        
+        .chat-area::-webkit-scrollbar-thumb {
             background: rgba(255, 255, 255, 0.3);
+            border-radius: 10px;
         }
-
-        #send-btn {
-            width: 45px;
-            height: 45px;
-            border-radius: 50%;
-            padding: 0;
-            justify-content: center;
+        
+        .chat-area::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.5);
         }
-
-        /* ===== SCROLL TO BOTTOM BUTTON ===== */
-        .scroll-to-bottom {
-            position: absolute;
-            bottom: 80px;
-            right: 20px;
-            width: 40px;
-            height: 40px;
-            background: linear-gradient(135deg, #667eea, #764ba2);
-            color: white;
-            border: none;
-            border-radius: 50%;
-            cursor: pointer;
-            display: none;
-            align-items: center;
-            justify-content: center;
-            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
-            transition: all 0.3s ease;
-            z-index: 5;
-        }
-
-        .scroll-to-bottom:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 16px rgba(102, 126, 234, 0.4);
-        }
-
-        .scroll-to-bottom.show {
-            display: flex;
-        }
-
-        /* Responsive */
+        
         @media (max-width: 480px) {
-            body {
-                padding: 0;
-            }
-            
-            .chat-container {
-                width: 100%;
+            .container {
                 height: 100vh;
                 border-radius: 0;
+                max-width: 100%;
             }
             
-            .chat-header {
-                padding: 15px;
-            }
-            
-            .header-left h1 {
-                font-size: 20px;
-            }
-            
-            .messages {
-                padding: 15px;
-            }
-            
-            .chat-footer {
-                padding: 15px;
-            }
-            
-            .message-bubble {
+            .message {
                 max-width: 85%;
+            }
+            
+            .controls {
+                flex-direction: column;
+                gap: 10px;
+            }
+            
+            .message-input {
+                margin-bottom: 10px;
             }
         }
     </style>
 </head>
 <body>
-    <div class="chat-container">
-        <div class="chat-header">
-            <div class="header-left">
-                <h1>🌐 HUBchat</h1>
-                <div class="online-status">
-                    <span class="status-dot"></span>
-                    <span id="online-count">0</span> online
-                </div>
-            </div>
-            <div class="header-right">
-                <button id="next-btn" class="btn btn-secondary" disabled>Next</button>
-                <div class="connection-status" id="connection-status">
-                    <span class="status-indicator disconnected"></span>
-                    <span class="status-text">Disconnected</span>
-                </div>
-            </div>
+    <div class="container">
+        <div class="header">
+            <h1>🌟 HUBchat</h1>
+            <p>Chat ẩn danh với người lạ trên toàn thế giới</p>
         </div>
-
-        <div class="chat-body" id="chat-body">
-            <div class="welcome-screen" id="welcome-screen">
-                <div class="welcome-content">
-                    <h2>🎭 Chào mừng đến HUBchat</h2>
-                    <p>Kết nối với những người lạ từ khắp nơi trên thế giới</p>
-                    <button id="start-chat-btn" class="btn btn-primary">Bắt đầu trò chuyện</button>
-                </div>
-            </div>
-            
-            <div class="messages-container" id="messages-container" style="display: none;">
-                <div class="messages" id="messages"></div>
-                <div class="typing-indicator" id="typing-indicator" style="display: none;">
-                    <span>Stranger đang gõ</span>
-                    <div class="typing-dots">
-                        <span></span>
-                        <span></span>
-                        <span></span>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- Scroll to bottom button -->
-            <button class="scroll-to-bottom" id="scroll-to-bottom">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <polyline points="6,9 12,15 18,9"></polyline>
-                </svg>
+        
+        <div class="status" id="status">
+            Nhấn "Bắt đầu trò chuyện" để tìm người lạ
+        </div>
+        
+        <div class="chat-area" id="chatArea">
+            <button class="start-button" id="startButton" onclick="hubChat.findStranger()">
+                🚀 Bắt đầu trò chuyện
             </button>
         </div>
-
-        <div class="chat-footer" id="chat-footer" style="display: none;">
-            <div class="message-input-container">
-                <input type="text" id="message-input" placeholder="Nhập tin nhắn..." disabled maxlength="500">
-                <button id="send-btn" class="btn btn-primary" disabled>
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <line x1="22" y1="2" x2="11" y2="13"></line>
-                        <polygon points="22,2 15,22 11,13 2,9"></polygon>
-                    </svg>
-                </button>
+        
+        <div class="input-area" id="inputArea" style="display: none;">
+            <input type="text" class="message-input" id="messageInput" 
+                   placeholder="Nhập tin nhắn..." maxlength="500">
+            <div class="controls">
+                <button class="send-button" id="sendButton" onclick="hubChat.sendMessage()">Gửi</button>
+                <button class="next-button" onclick="hubChat.nextStranger()">Tiếp theo</button>
             </div>
         </div>
     </div>
 
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <script>
         class HUBChat {
             constructor() {
                 this.socket = io();
+                this.currentUserId = null;  // ID của user hiện tại
                 this.isConnected = false;
-                this.isTyping = false;
-                this.typingTimeout = null;
                 this.isAtBottom = true;
+                this.typingTimeout = null;
                 
-                this.initializeElements();
-                this.bindEvents();
-                this.setupSocketListeners();
+                this.initializeSocketEvents();
+                this.initializeUI();
             }
             
-            initializeElements() {
-                this.elements = {
-                    welcomeScreen: document.getElementById('welcome-screen'),
-                    messagesContainer: document.getElementById('messages-container'),
-                    chatFooter: document.getElementById('chat-footer'),
-                    messages: document.getElementById('messages'),
-                    messageInput: document.getElementById('message-input'),
-                    sendBtn: document.getElementById('send-btn'),
-                    startChatBtn: document.getElementById('start-chat-btn'),
-                    nextBtn: document.getElementById('next-btn'),
-                    onlineCount: document.getElementById('online-count'),
-                    connectionStatus: document.getElementById('connection-status'),
-                    typingIndicator: document.getElementById('typing-indicator'),
-                    scrollToBottomBtn: document.getElementById('scroll-to-bottom')
-                };
+            initializeSocketEvents() {
+                this.socket.on('connect', () => {
+                    console.log('Đã kết nối server');
+                });
+                
+                this.socket.on('stranger_found', (data) => {
+                    this.currentUserId = data.your_id;  // Lưu ID của mình
+                    this.isConnected = true;
+                    this.updateStatus('🎉 Đã tìm thấy người lạ! Bắt đầu trò chuyện...');
+                    this.showChatInterface();
+                    this.clearMessages();
+                });
+                
+                this.socket.on('waiting_for_stranger', () => {
+                    this.updateStatus('🔍 Đang tìm người lạ...');
+                });
+                
+                this.socket.on('receive_message', (data) => {
+                    // Phân biệt tin nhắn của mình và đối phương
+                    const isMyMessage = (data.sender_sid === this.socket.id);
+                    this.addMessage(data.message, data.timestamp, isMyMessage);
+                });
+                
+                this.socket.on('user_typing', (data) => {
+                    this.showTypingIndicator();
+                });
+                
+                this.socket.on('user_stop_typing', () => {
+                    this.hideTypingIndicator();
+                });
+                
+                this.socket.on('stranger_disconnected', () => {
+                    this.isConnected = false;
+                    this.updateStatus('😢 Người lạ đã ngắt kết nối');
+                    this.hideChatInterface();
+                    this.addSystemMessage('Người lạ đã rời khỏi cuộc trò chuyện');
+                });
+                
+                this.socket.on('disconnect', () => {
+                    this.isConnected = false;
+                    this.updateStatus('❌ Mất kết nối server');
+                });
             }
             
-            bindEvents() {
-                // Start chat
-                this.elements.startChatBtn.addEventListener('click', () => {
-                    this.findStranger();
-                });
+            initializeUI() {
+                const messageInput = document.getElementById('messageInput');
+                const sendButton = document.getElementById('sendButton');
                 
-                // Send message
-                this.elements.sendBtn.addEventListener('click', () => {
-                    this.sendMessage();
-                });
-                
-                // Enter key to send
-                this.elements.messageInput.addEventListener('keypress', (e) => {
-                    if (e.key === 'Enter') {
+                messageInput.addEventListener('keypress', (e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
                         this.sendMessage();
                     }
                 });
                 
-                // Typing indicator
-                this.elements.messageInput.addEventListener('input', () => {
-                    this.handleTyping();
-                });
-                
-                // Next stranger
-                this.elements.nextBtn.addEventListener('click', () => {
-                    this.nextStranger();
-                });
-                
-                // Scroll detection
-                this.elements.messages.addEventListener('scroll', () => {
-                    this.handleScroll();
-                });
-                
-                // Scroll to bottom button
-                this.elements.scrollToBottomBtn.addEventListener('click', () => {
-                    this.scrollToBottom(true);
-                });
-            }
-            
-            setupSocketListeners() {
-                this.socket.on('connect', () => {
-                    console.log('Đã kết nối tới server');
-                });
-                
-                this.socket.on('online_count', (data) => {
-                    this.elements.onlineCount.textContent = data.count;
-                });
-                
-                this.socket.on('waiting_for_stranger', () => {
-                    this.updateConnectionStatus('Tìm kiếm người lạ...', 'connecting');
-                    this.addSystemMessage('Đang tìm kiếm người lạ...');
-                });
-                
-                this.socket.on('stranger_found', () => {
-                    this.isConnected = true;
-                    this.updateConnectionStatus('Đã kết nối', 'connected');
-                    this.enableChat();
-                });
-                
-                this.socket.on('system_message', (data) => {
-                    this.addSystemMessage(data.message);
-                });
-                
-                this.socket.on('receive_message', (data) => {
-                    this.addMessage(data.message, data.sender === 'you' ? 'user' : 'stranger', data.timestamp);
-                });
-                
-                this.socket.on('partner_typing', (data) => {
-                    if (data.typing) {
-                        this.showTypingIndicator();
-                    } else {
-                        this.hideTypingIndicator();
+                messageInput.addEventListener('input', () => {
+                    if (this.isConnected) {
+                        this.handleTyping();
                     }
                 });
                 
-                this.socket.on('partner_disconnected', () => {
-                    this.isConnected = false;
-                    this.updateConnectionStatus('Đã ngắt kết nối', 'disconnected');
-                    this.disableChat();
-                    this.addSystemMessage('Người lạ đã ngắt kết nối');
-                    this.hideTypingIndicator();
+                const chatArea = document.getElementById('chatArea');
+                chatArea.addEventListener('scroll', () => {
+                    const { scrollTop, scrollHeight, clientHeight } = chatArea;
+                    this.isAtBottom = scrollTop + clientHeight >= scrollHeight - 10;
                 });
             }
             
             findStranger() {
-                this.elements.welcomeScreen.style.display = 'none';
-                this.elements.messagesContainer.style.display = 'flex';
-                this.elements.chatFooter.style.display = 'block';
-                
                 this.socket.emit('find_stranger');
+                this.updateStatus('🔍 Đang tìm người lạ...');
+                document.getElementById('startButton').style.display = 'none';
             }
             
             sendMessage() {
-                const message = this.elements.messageInput.value.trim();
-                if (!message || !this.isConnected) return;
+                const messageInput = document.getElementById('messageInput');
+                const message = messageInput.value.trim();
                 
-                const timestamp = new Date().toLocaleTimeString('vi-VN', {
-                    hour: '2-digit',
-                    minute: '2-digit'
-                });
-                
-                this.socket.emit('send_message', {
-                    message: message,
-                    timestamp: timestamp
-                });
-                
-                this.elements.messageInput.value = '';
-                this.stopTyping();
+                if (message && this.isConnected) {
+                    this.socket.emit('send_message', { message: message });
+                    messageInput.value = '';
+                    this.stopTyping();
+                }
             }
             
-            addMessage(text, sender, timestamp) {
+            addMessage(message, timestamp, isMyMessage) {
+                const chatArea = document.getElementById('chatArea');
                 const messageDiv = document.createElement('div');
-                messageDiv.className = `message ${sender}`;
                 
-                if (sender === 'system') {
-                    messageDiv.innerHTML = `<div class="system-message">${this.escapeHtml(text)}</div>`;
-                } else {
-                    messageDiv.innerHTML = `
-                        <div class="message-bubble">
-                            ${this.escapeHtml(text)}
-                            ${timestamp ? `<div class="message-time">${timestamp}</div>` : ''}
-                        </div>
-                    `;
-                }
+                // Phân biệt class dựa trên isMyMessage
+                messageDiv.className = `message ${isMyMessage ? 'my-message' : 'their-message'}`;
                 
-                this.elements.messages.appendChild(messageDiv);
+                messageDiv.innerHTML = `
+                    ${this.escapeHtml(message)}
+                    <span class="message-time">${timestamp}</span>
+                `;
                 
-                // Auto scroll if user is at bottom
+                chatArea.appendChild(messageDiv);
+                
                 if (this.isAtBottom) {
                     this.scrollToBottom();
                 }
             }
             
-            addSystemMessage(text) {
-                this.addMessage(text, 'system');
+            addSystemMessage(message) {
+                const chatArea = document.getElementById('chatArea');
+                const messageDiv = document.createElement('div');
+                messageDiv.style.cssText = `
+                    text-align: center;
+                    color: rgba(255, 255, 255, 0.7);
+                    font-size: 12px;
+                    padding: 10px;
+                    font-style: italic;
+                `;
+                messageDiv.textContent = message;
+                chatArea.appendChild(messageDiv);
+                this.scrollToBottom();
             }
             
             handleTyping() {
-                if (!this.isConnected) return;
-                
-                if (!this.isTyping) {
-                    this.isTyping = true;
-                    this.socket.emit('typing', { typing: true });
+                if (this.isConnected) {
+                    this.socket.emit('typing');
+                    
+                    clearTimeout(this.typingTimeout);
+                    this.typingTimeout = setTimeout(() => {
+                        this.stopTyping();
+                    }, 1000);
                 }
-                
-                clearTimeout(this.typingTimeout);
-                this.typingTimeout = setTimeout(() => {
-                    this.stopTyping();
-                }, 1000);
             }
             
             stopTyping() {
-                if (this.isTyping) {
-                    this.isTyping = false;
-                    this.socket.emit('typing', { typing: false });
+                if (this.isConnected) {
+                    this.socket.emit('stop_typing');
                 }
             }
             
             showTypingIndicator() {
-                this.elements.typingIndicator.style.display = 'flex';
-                if (this.isAtBottom) {
-                    this.scrollToBottom();
-                }
+                this.hideTypingIndicator();
+                
+                const chatArea = document.getElementById('chatArea');
+                const typingDiv = document.createElement('div');
+                typingDiv.className = 'typing-indicator';
+                typingDiv.id = 'typingIndicator';
+                typingDiv.textContent = 'Đang nhập...';
+                
+                chatArea.appendChild(typingDiv);
+                this.scrollToBottom();
             }
             
             hideTypingIndicator() {
-                this.elements.typingIndicator.style.display = 'none';
-            }
-            
-            enableChat() {
-                this.elements.messageInput.disabled = false;
-                this.elements.sendBtn.disabled = false;
-                this.elements.nextBtn.disabled = false;
-                this.elements.messageInput.focus();
-            }
-            
-            disableChat() {
-                this.elements.messageInput.disabled = true;
-                this.elements.sendBtn.disabled = true;
-                this.elements.nextBtn.disabled = false;
-            }
-            
-            updateConnectionStatus(text, status) {
-                const statusElement = this.elements.connectionStatus;
-                const indicator = statusElement.querySelector('.status-indicator');
-                const textElement = statusElement.querySelector('.status-text');
-                
-                textElement.textContent = text;
-                indicator.className = `status-indicator ${status}`;
+                const typingIndicator = document.getElementById('typingIndicator');
+                if (typingIndicator) {
+                    typingIndicator.remove();
+                }
             }
             
             nextStranger() {
                 this.socket.emit('next_stranger');
-                this.elements.messages.innerHTML = '';
+                this.isConnected = false;
+                this.updateStatus('🔍 Đang tìm người lạ mới...');
                 this.hideTypingIndicator();
-                this.updateConnectionStatus('Tìm kiếm...', 'connecting');
-                this.elements.scrollToBottomBtn.classList.remove('show');
             }
             
-            handleScroll() {
-                const messagesEl = this.elements.messages;
-                const scrollTop = messagesEl.scrollTop;
-                const scrollHeight = messagesEl.scrollHeight;
-                const clientHeight = messagesEl.clientHeight;
-                
-                // Check if user is at bottom
-                this.isAtBottom = scrollTop + clientHeight >= scrollHeight - 10;
-                
-                // Show/hide scroll to bottom button
-                if (this.isAtBottom) {
-                    this.elements.scrollToBottomBtn.classList.remove('show');
-                } else {
-                    this.elements.scrollToBottomBtn.classList.add('show');
-                }
+            updateStatus(message) {
+                document.getElementById('status').textContent = message;
             }
             
-            scrollToBottom(force = false) {
-                if (force || this.isAtBottom) {
-                    setTimeout(() => {
-                        this.elements.messages.scrollTop = this.elements.messages.scrollHeight;
-                        this.isAtBottom = true;
-                        this.elements.scrollToBottomBtn.classList.remove('show');
-                    }, 50);
-                }
+            showChatInterface() {
+                document.getElementById('inputArea').style.display = 'flex';
+                document.getElementById('messageInput').focus();
+            }
+            
+            hideChatInterface() {
+                document.getElementById('inputArea').style.display = 'none';
+                document.getElementById('startButton').style.display = 'block';
+            }
+            
+            clearMessages() {
+                const chatArea = document.getElementById('chatArea');
+                const messages = chatArea.querySelectorAll('.message, .typing-indicator');
+                messages.forEach(msg => msg.remove());
+            }
+            
+            scrollToBottom() {
+                const chatArea = document.getElementById('chatArea');
+                setTimeout(() => {
+                    chatArea.scrollTop = chatArea.scrollHeight;
+                }, 10);
             }
             
             escapeHtml(text) {
@@ -775,122 +635,15 @@ HTML_TEMPLATE = '''
                 return div.innerHTML;
             }
         }
-
+        
         // Khởi tạo ứng dụng
-        document.addEventListener('DOMContentLoaded', () => {
-            new HUBChat();
-        });
+        const hubChat = new HUBChat();
     </script>
 </body>
 </html>
 '''
 
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
-
-@socketio.on('connect')
-def on_connect():
-    user_id = str(uuid.uuid4())
-    users[request.sid] = {
-        'id': user_id,
-        'room': None,
-        'partner': None
-    }
-    emit('user_connected', {'user_id': user_id})
-    emit('online_count', {'count': len(users)}, broadcast=True)
-
-@socketio.on('disconnect')
-def on_disconnect():
-    if request.sid in users:
-        user = users[request.sid]
-        
-        # Thông báo cho partner nếu có
-        if user['partner']:
-            emit('partner_disconnected', room=user['partner'])
-        
-        # Xóa khỏi waiting list
-        if request.sid in waiting_users:
-            waiting_users.remove(request.sid)
-        
-        # Xóa room nếu có
-        if user['room']:
-            if user['room'] in active_rooms:
-                del active_rooms[user['room']]
-        
-        del users[request.sid]
-        emit('online_count', {'count': len(users)}, broadcast=True)
-
-@socketio.on('find_stranger')
-def find_stranger():
-    current_user = request.sid
-    
-    if current_user in waiting_users:
-        return
-    
-    if waiting_users:
-        # Ghép với người đang chờ
-        partner = waiting_users.pop(0)
-        room_id = str(uuid.uuid4())
-        
-        # Cập nhật thông tin người dùng
-        users[current_user]['room'] = room_id
-        users[current_user]['partner'] = partner
-        users[partner]['room'] = room_id
-        users[partner]['partner'] = current_user
-        
-        # Tạo phòng chat
-        active_rooms[room_id] = [current_user, partner]
-        
-        # Thêm vào room
-        join_room(room_id, sid=current_user)
-        join_room(room_id, sid=partner)
-        
-        # Thông báo kết nối thành công
-        emit('stranger_found', room=room_id)
-        emit('system_message', {'message': 'Đã kết nối với một người lạ! 🎉'}, room=room_id)
-        
-    else:
-        # Thêm vào danh sách chờ
-        waiting_users.append(current_user)
-        emit('waiting_for_stranger')
-
-@socketio.on('send_message')
-def handle_message(data):
-    user = users.get(request.sid)
-    if user and user['room']:
-        message_data = {
-            'message': data['message'],
-            'sender': 'stranger' if request.sid != user['partner'] else 'you',
-            'timestamp': data.get('timestamp')
-        }
-        emit('receive_message', message_data, room=user['room'])
-
-@socketio.on('typing')
-def handle_typing(data):
-    user = users.get(request.sid)
-    if user and user['partner']:
-        emit('partner_typing', data, room=user['partner'])
-
-@socketio.on('next_stranger')
-def next_stranger():
-    user = users.get(request.sid)
-    if user:
-        # Thông báo cho partner
-        if user['partner']:
-            emit('partner_disconnected', room=user['partner'])
-            users[user['partner']]['room'] = None
-            users[user['partner']]['partner'] = None
-        
-        # Reset user
-        if user['room'] and user['room'] in active_rooms:
-            del active_rooms[user['room']]
-        
-        users[request.sid]['room'] = None
-        users[request.sid]['partner'] = None
-        
-        # Tìm stranger mới
-        find_stranger()
-
 if __name__ == '__main__':
-    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
+    import os
+    port = int(os.environ.get('PORT', 5000))
+    socketio.run(app, debug=False, host='0.0.0.0', port=port)
