@@ -2,7 +2,6 @@ from flask import Flask, render_template_string, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import uuid
 import random
-import os
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'hubchat_secret_key'
@@ -35,6 +34,7 @@ HTML_TEMPLATE = '''
             display: flex;
             justify-content: center;
             align-items: center;
+            overflow: hidden; /* Ngăn body scroll */
         }
 
         .chat-container {
@@ -47,6 +47,7 @@ HTML_TEMPLATE = '''
             display: flex;
             flex-direction: column;
             overflow: hidden;
+            position: relative; /* Fix position */
         }
 
         .chat-header {
@@ -56,6 +57,7 @@ HTML_TEMPLATE = '''
             display: flex;
             justify-content: space-between;
             align-items: center;
+            flex-shrink: 0; /* Không co lại */
         }
 
         .header-left h1 {
@@ -117,11 +119,14 @@ HTML_TEMPLATE = '''
             background: #f39c12;
         }
 
+        /* ===== CHAT BODY - FIX CHÍNH ===== */
         .chat-body {
             flex: 1;
             display: flex;
             flex-direction: column;
             position: relative;
+            height: 0; /* Quan trọng: force flex child height */
+            overflow: hidden;
         }
 
         .welcome-screen {
@@ -131,10 +136,6 @@ HTML_TEMPLATE = '''
             align-items: center;
             text-align: center;
             padding: 40px;
-        }
-
-        .welcome-content {
-            text-align: center;
         }
 
         .welcome-content {
@@ -154,23 +155,59 @@ HTML_TEMPLATE = '''
             margin-bottom: 30px;
         }
 
+        /* ===== MESSAGES CONTAINER - FIX SCROLLBAR ===== */
         .messages-container {
             flex: 1;
             display: flex;
             flex-direction: column;
+            height: 100%;
+            overflow: hidden;
         }
 
         .messages {
             flex: 1;
             padding: 20px;
             overflow-y: auto;
+            overflow-x: hidden;
             scroll-behavior: smooth;
-            min-height: 0; /* Ensure messages container can shrink and scroll */
+            height: 0; /* Quan trọng */
+            
+            /* Custom Scrollbar */
+            scrollbar-width: thin;
+            scrollbar-color: #667eea #f0f0f0;
+        }
+
+        /* Custom Scrollbar cho Webkit browsers */
+        .messages::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .messages::-webkit-scrollbar-track {
+            background: rgba(240, 240, 240, 0.5);
+            border-radius: 10px;
+            margin: 5px;
+        }
+
+        .messages::-webkit-scrollbar-thumb {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 10px;
+            transition: all 0.3s ease;
+        }
+
+        .messages::-webkit-scrollbar-thumb:hover {
+            background: linear-gradient(135deg, #5a6fd8 0%, #6a4190 100%);
+            transform: scaleY(1.1);
+        }
+
+        .messages::-webkit-scrollbar-corner {
+            background: transparent;
         }
 
         .message {
             margin-bottom: 15px;
             animation: fadeIn 0.3s ease-in;
+            word-wrap: break-word;
+            max-width: 100%;
         }
 
         @keyframes fadeIn {
@@ -183,6 +220,10 @@ HTML_TEMPLATE = '''
             color: #7f8c8d;
             font-style: italic;
             font-size: 14px;
+            padding: 10px;
+            background: rgba(127, 140, 141, 0.1);
+            border-radius: 15px;
+            margin: 10px 0;
         }
 
         .message.user {
@@ -196,11 +237,13 @@ HTML_TEMPLATE = '''
         }
 
         .message-bubble {
-            max-width: 70%;
+            max-width: 75%;
             padding: 12px 16px;
             border-radius: 18px;
             word-wrap: break-word;
+            word-break: break-word;
             position: relative;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
         }
 
         .message.user .message-bubble {
@@ -217,10 +260,16 @@ HTML_TEMPLATE = '''
 
         .message-time {
             font-size: 11px;
-            opacity: 0.6;
+            opacity: 0.7;
             margin-top: 5px;
+            text-align: right;
         }
 
+        .message.stranger .message-time {
+            text-align: left;
+        }
+
+        /* ===== TYPING INDICATOR - FIX ===== */
         .typing-indicator {
             padding: 10px 20px;
             display: flex;
@@ -228,6 +277,9 @@ HTML_TEMPLATE = '''
             gap: 10px;
             color: #7f8c8d;
             font-size: 14px;
+            flex-shrink: 0; /* Không co lại */
+            background: rgba(127, 140, 141, 0.05);
+            border-top: 1px solid rgba(127, 140, 141, 0.1);
         }
 
         .typing-dots {
@@ -251,10 +303,14 @@ HTML_TEMPLATE = '''
             40% { transform: scale(1); opacity: 1; }
         }
 
+        /* ===== CHAT FOOTER - FIX POSITION ===== */
         .chat-footer {
             padding: 20px;
             background: #f8f9fa;
             border-top: 1px solid #e9ecef;
+            flex-shrink: 0; /* Không co lại */
+            position: relative;
+            z-index: 10;
         }
 
         .message-input-container {
@@ -271,15 +327,18 @@ HTML_TEMPLATE = '''
             font-size: 14px;
             outline: none;
             transition: border-color 0.3s ease;
+            background: white;
         }
 
         #message-input:focus {
             border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
         }
 
         #message-input:disabled {
             background: #f8f9fa;
             cursor: not-allowed;
+            opacity: 0.7;
         }
 
         .btn {
@@ -328,8 +387,41 @@ HTML_TEMPLATE = '''
             justify-content: center;
         }
 
+        /* ===== SCROLL TO BOTTOM BUTTON ===== */
+        .scroll-to-bottom {
+            position: absolute;
+            bottom: 80px;
+            right: 20px;
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            cursor: pointer;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+            transition: all 0.3s ease;
+            z-index: 5;
+        }
+
+        .scroll-to-bottom:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 16px rgba(102, 126, 234, 0.4);
+        }
+
+        .scroll-to-bottom.show {
+            display: flex;
+        }
+
         /* Responsive */
         @media (max-width: 480px) {
+            body {
+                padding: 0;
+            }
+            
             .chat-container {
                 width: 100%;
                 height: 100vh;
@@ -350,6 +442,10 @@ HTML_TEMPLATE = '''
             
             .chat-footer {
                 padding: 15px;
+            }
+            
+            .message-bubble {
+                max-width: 85%;
             }
         }
     </style>
@@ -393,11 +489,18 @@ HTML_TEMPLATE = '''
                     </div>
                 </div>
             </div>
+            
+            <!-- Scroll to bottom button -->
+            <button class="scroll-to-bottom" id="scroll-to-bottom">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="6,9 12,15 18,9"></polyline>
+                </svg>
+            </button>
         </div>
 
         <div class="chat-footer" id="chat-footer" style="display: none;">
             <div class="message-input-container">
-                <input type="text" id="message-input" placeholder="Nhập tin nhắn..." disabled>
+                <input type="text" id="message-input" placeholder="Nhập tin nhắn..." disabled maxlength="500">
                 <button id="send-btn" class="btn btn-primary" disabled>
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <line x1="22" y1="2" x2="11" y2="13"></line>
@@ -416,6 +519,7 @@ HTML_TEMPLATE = '''
                 this.isConnected = false;
                 this.isTyping = false;
                 this.typingTimeout = null;
+                this.isAtBottom = true;
                 
                 this.initializeElements();
                 this.bindEvents();
@@ -434,7 +538,8 @@ HTML_TEMPLATE = '''
                     nextBtn: document.getElementById('next-btn'),
                     onlineCount: document.getElementById('online-count'),
                     connectionStatus: document.getElementById('connection-status'),
-                    typingIndicator: document.getElementById('typing-indicator')
+                    typingIndicator: document.getElementById('typing-indicator'),
+                    scrollToBottomBtn: document.getElementById('scroll-to-bottom')
                 };
             }
             
@@ -464,6 +569,16 @@ HTML_TEMPLATE = '''
                 // Next stranger
                 this.elements.nextBtn.addEventListener('click', () => {
                     this.nextStranger();
+                });
+                
+                // Scroll detection
+                this.elements.messages.addEventListener('scroll', () => {
+                    this.handleScroll();
+                });
+                
+                // Scroll to bottom button
+                this.elements.scrollToBottomBtn.addEventListener('click', () => {
+                    this.scrollToBottom(true);
                 });
             }
             
@@ -543,18 +658,22 @@ HTML_TEMPLATE = '''
                 messageDiv.className = `message ${sender}`;
                 
                 if (sender === 'system') {
-                    messageDiv.innerHTML = `<div class="system-message">${text}</div>`;
+                    messageDiv.innerHTML = `<div class="system-message">${this.escapeHtml(text)}</div>`;
                 } else {
                     messageDiv.innerHTML = `
                         <div class="message-bubble">
-                            ${text}
+                            ${this.escapeHtml(text)}
                             ${timestamp ? `<div class="message-time">${timestamp}</div>` : ''}
                         </div>
                     `;
                 }
                 
                 this.elements.messages.appendChild(messageDiv);
-                this.scrollToBottom();
+                
+                // Auto scroll if user is at bottom
+                if (this.isAtBottom) {
+                    this.scrollToBottom();
+                }
             }
             
             addSystemMessage(text) {
@@ -584,7 +703,9 @@ HTML_TEMPLATE = '''
             
             showTypingIndicator() {
                 this.elements.typingIndicator.style.display = 'flex';
-                this.scrollToBottom();
+                if (this.isAtBottom) {
+                    this.scrollToBottom();
+                }
             }
             
             hideTypingIndicator() {
@@ -618,12 +739,40 @@ HTML_TEMPLATE = '''
                 this.elements.messages.innerHTML = '';
                 this.hideTypingIndicator();
                 this.updateConnectionStatus('Tìm kiếm...', 'connecting');
+                this.elements.scrollToBottomBtn.classList.remove('show');
             }
             
-            scrollToBottom() {
-                setTimeout(() => {
-                    this.elements.messages.scrollTop = this.elements.messages.scrollHeight;
-                }, 100);
+            handleScroll() {
+                const messagesEl = this.elements.messages;
+                const scrollTop = messagesEl.scrollTop;
+                const scrollHeight = messagesEl.scrollHeight;
+                const clientHeight = messagesEl.clientHeight;
+                
+                // Check if user is at bottom
+                this.isAtBottom = scrollTop + clientHeight >= scrollHeight - 10;
+                
+                // Show/hide scroll to bottom button
+                if (this.isAtBottom) {
+                    this.elements.scrollToBottomBtn.classList.remove('show');
+                } else {
+                    this.elements.scrollToBottomBtn.classList.add('show');
+                }
+            }
+            
+            scrollToBottom(force = false) {
+                if (force || this.isAtBottom) {
+                    setTimeout(() => {
+                        this.elements.messages.scrollTop = this.elements.messages.scrollHeight;
+                        this.isAtBottom = true;
+                        this.elements.scrollToBottomBtn.classList.remove('show');
+                    }, 50);
+                }
+            }
+            
+            escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
             }
         }
 
@@ -744,5 +893,4 @@ def next_stranger():
         find_stranger()
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    socketio.run(app, debug=True, host='0.0.0.0', port=port)
+    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
